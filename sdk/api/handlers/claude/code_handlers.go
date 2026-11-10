@@ -579,16 +579,7 @@ func (h *ClaudeCodeAPIHandler) toClaudeErrorWithRetryAfter(msg *interfaces.Error
 	}
 	errType, message := claudeErrorDetailFromText(status, errText)
 	if status == http.StatusTooManyRequests && msg != nil && msg.Error != nil {
-		var cooldown interface{ IsModelCooldown() bool }
-		if errors.As(msg.Error, &cooldown) && cooldown != nil && cooldown.IsModelCooldown() {
-			if seconds, errParse := strconv.ParseInt(retryAfter, 10, 64); errParse == nil && seconds > 0 {
-				delay := retryAfter + "s"
-				if seconds <= (1<<63-1)/int64(time.Second) {
-					delay = (time.Duration(seconds) * time.Second).String()
-				}
-				message += " (reset after " + delay + ")"
-			}
-		}
+		message = claudeMessageWithResetAfter(message, msg.Error, retryAfter)
 	}
 	response := claudeErrorResponse{
 		Type: "error",
@@ -601,6 +592,30 @@ func (h *ClaudeCodeAPIHandler) toClaudeErrorWithRetryAfter(msg *interfaces.Error
 		response.Error.Details = &claudeErrorDetails{ErrorCode: "thread_not_found"}
 	}
 	return response
+}
+
+// claudeMessageWithResetAfter states a 429's trusted Retry-After delay in its message.
+// Claude Code drops the Retry-After header and reports only the message, so clients
+// that schedule a retry at the reset (for example T3 Code) read this suffix instead.
+// retryAfter must be the locally trusted value from coreauth.SafeResponseHeaders, never
+// a raw upstream header, so the text always matches the Retry-After CPA writes. This
+// covers the first upstream 429 as well as later pool cooldowns. A cooldown always
+// states its own deadline; any other 429 keeps a reset hint it already carries.
+func claudeMessageWithResetAfter(message string, err error, retryAfter string) string {
+	seconds, errParse := strconv.ParseInt(retryAfter, 10, 64)
+	if errParse != nil || seconds <= 0 {
+		return message
+	}
+	var cooldown interface{ IsModelCooldown() bool }
+	isCooldown := errors.As(err, &cooldown) && cooldown != nil && cooldown.IsModelCooldown()
+	if !isCooldown && strings.Contains(message, "(reset after ") {
+		return message
+	}
+	delay := retryAfter + "s"
+	if seconds <= (1<<63-1)/int64(time.Second) {
+		delay = (time.Duration(seconds) * time.Second).String()
+	}
+	return message + " (reset after " + delay + ")"
 }
 
 func (h *ClaudeCodeAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.ErrorMessage) {

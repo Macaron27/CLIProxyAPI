@@ -224,3 +224,156 @@ func TestClaudeCooldownMessagesRoute(t *testing.T) {
 		})
 	}
 }
+
+const upstreamRateLimitTestBody = `{"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account's rate limit. Please try again later."}}`
+
+// upstreamRateLimitTestError mimics an executor 429 that carries the parsed
+// Anthropic reset as its retry hint.
+type upstreamRateLimitTestError struct {
+	hint time.Duration
+}
+
+func (upstreamRateLimitTestError) Error() string   { return upstreamRateLimitTestBody }
+func (upstreamRateLimitTestError) StatusCode() int { return http.StatusTooManyRequests }
+func (e upstreamRateLimitTestError) RetryAfter() *time.Duration {
+	hint := e.hint
+	return &hint
+}
+
+type rateLimitedClaudeExecutor struct {
+	hint time.Duration
+}
+
+func (*rateLimitedClaudeExecutor) Identifier() string { return "rate-limited-claude-executor" }
+
+func (e *rateLimitedClaudeExecutor) Execute(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, upstreamRateLimitTestError{hint: e.hint}
+}
+
+func (e *rateLimitedClaudeExecutor) ExecuteStream(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	return nil, upstreamRateLimitTestError{hint: e.hint}
+}
+
+func (*rateLimitedClaudeExecutor) Refresh(_ context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+	return auth, nil
+}
+
+func (*rateLimitedClaudeExecutor) CountTokens(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, errors.New("not implemented")
+}
+
+func (*rateLimitedClaudeExecutor) HttpRequest(context.Context, *coreauth.Auth, *http.Request) (*http.Response, error) {
+	return nil, errors.New("not implemented")
+}
+
+// TestClaudeFirstUpstream429StatesTrustedResetAfter covers the request that
+// first exhausts the last credential: the client receives the upstream 429
+// itself, not a pool cooldown, and its message must still state the reset.
+func TestClaudeFirstUpstream429StatesTrustedResetAfter(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, streaming := range []bool{false, true} {
+		t.Run(strconv.FormatBool(streaming), func(t *testing.T) {
+			executor := &rateLimitedClaudeExecutor{hint: 8250 * time.Second}
+			manager := coreauth.NewManager(nil, nil, nil)
+			manager.RegisterExecutor(executor)
+			suffix := strconv.FormatBool(streaming)
+			model := "first-upstream-429-model-" + suffix
+			authID := "first-upstream-429-auth-" + suffix
+			auth := &coreauth.Auth{ID: authID, Provider: executor.Identifier(), Status: coreauth.StatusActive}
+			if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+				t.Fatalf("register auth: %v", errRegister)
+			}
+			registry.GetGlobalRegistry().RegisterClient(authID, executor.Identifier(), []*registry.ModelInfo{{ID: model}})
+			t.Cleanup(func() {
+				registry.GetGlobalRegistry().UnregisterClient(authID)
+			})
+			handler := NewClaudeCodeAPIHandler(handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager))
+			router := gin.New()
+			router.POST("/v1/messages", handler.ClaudeMessages)
+
+			requestBody := `{"model":"` + model + `","messages":[{"role":"user","content":"hi"}],"stream":` + suffix + `}`
+			request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(requestBody))
+			request.Header.Set("Content-Type", "application/json")
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, request)
+
+			if recorder.Code != http.StatusTooManyRequests {
+				t.Fatalf("status = %d, want 429; body=%s", recorder.Code, recorder.Body.String())
+			}
+			seconds, errSeconds := strconv.ParseInt(recorder.Header().Get("Retry-After"), 10, 64)
+			if errSeconds != nil || seconds <= 0 || seconds > 8250 {
+				t.Fatalf("Retry-After = %q, want positive seconds up to 8250", recorder.Header().Get("Retry-After"))
+			}
+			if got := ojson.GetBytesNoCopy(recorder.Body.Bytes(), "error.type").String(); got != "rate_limit_error" {
+				t.Fatalf("error.type = %q, want rate_limit_error", got)
+			}
+			message := ojson.GetBytesNoCopy(recorder.Body.Bytes(), "error.message").String()
+			want := "This request would exceed your account's rate limit. Please try again later. (reset after " + (time.Duration(seconds) * time.Second).String() + ")"
+			if message != want {
+				t.Fatalf("error.message = %q, want %q", message, want)
+			}
+		})
+	}
+}
+
+// safeRetryAfterTestError carries a locally trusted Retry-After the way Home
+// and plugin safe-header carriers do.
+type safeRetryAfterTestError struct {
+	msg        string
+	retryAfter string
+}
+
+func (e safeRetryAfterTestError) Error() string { return e.msg }
+func (e safeRetryAfterTestError) SafeResponseHeaders() http.Header {
+	return http.Header{"Retry-After": {e.retryAfter}}
+}
+
+func TestClaudeTrusted429KeepsExistingResetHint(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	handler := NewClaudeCodeAPIHandler(&handlers.BaseAPIHandler{})
+	const upstream = "upstream gateway limit (reset after 5m0s)"
+	handler.WriteErrorResponse(c, &interfaces.ErrorMessage{
+		StatusCode: http.StatusTooManyRequests,
+		Error:      safeRetryAfterTestError{msg: `{"error":{"type":"rate_limit_error","message":"` + upstream + `"}}`, retryAfter: "300"},
+	})
+	if got := recorder.Header().Get("Retry-After"); got != "300" {
+		t.Fatalf("Retry-After = %q, want trusted 300", got)
+	}
+	if got := ojson.GetBytesNoCopy(recorder.Body.Bytes(), "error.message").String(); got != upstream {
+		t.Fatalf("error.message = %q, want existing hint kept once: %q", got, upstream)
+	}
+}
+
+func TestClaudeTrusted429ResetAfterInCommittedStream(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	c.Header("Content-Type", "text/event-stream")
+	if _, errWrite := c.Writer.Write([]byte(": keep-alive\n\n")); errWrite != nil {
+		t.Fatalf("write keep-alive: %v", errWrite)
+	}
+	c.Writer.Flush()
+
+	handler := NewClaudeCodeAPIHandler(&handlers.BaseAPIHandler{})
+	errs := make(chan *interfaces.ErrorMessage, 1)
+	errs <- &interfaces.ErrorMessage{
+		StatusCode: http.StatusTooManyRequests,
+		Error:      safeRetryAfterTestError{msg: upstreamRateLimitTestBody, retryAfter: "300"},
+	}
+	close(errs)
+	handler.forwardClaudeStream(c, c.Writer, func(error) {}, nil, errs)
+
+	body := recorder.Body.String()
+	if !strings.Contains(body, "event: error\ndata: ") {
+		t.Fatalf("body = %q; want a terminal SSE error", body)
+	}
+	_, event, _ := strings.Cut(body, "event: error\ndata: ")
+	message := ojson.Get(strings.TrimSpace(event), "error.message").String()
+	if !strings.HasSuffix(message, "Please try again later. (reset after 5m0s)") {
+		t.Fatalf("SSE error.message = %q, want upstream message with reset after 5m0s", message)
+	}
+}
